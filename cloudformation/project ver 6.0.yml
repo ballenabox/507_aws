@@ -1,0 +1,607 @@
+Parameters:
+  # 인스턴스에 사용할 키를 선택합니다.
+  Key:
+    Description: KeyPair
+    Type: AWS::EC2::KeyPair::KeyName
+  # 첫 배포 리전에서 나온 GA-ARN 다른리전에서 참조시 사용
+  # GAListenerARN:
+    # Description: GA Listener ARN Name
+    # Type: String
+  
+  # VPC, Subnet의 CIDR을 스택 생성 시 작성해 입력합니다.
+  # 퍼블릭 서브넷 2개, 프라이빗 서브넷 1개
+  # Seoul은 10.10.0.0/16, Singapore는 10.20.0.0/16, Osaka는 10.30.0.0/16
+  VPCCidr:
+    Description: Cidr Block for VPC
+    Type: String
+    Default: 10.10.0.0/16
+  PublicSubnet1Cidr:
+    Description: Cidr Block for Public Subnet1
+    Type: String
+    Default: 10.10.10.0/24
+  PublicSubnet2Cidr:
+    Description: Cidr Block for Public Subnet2
+    Type: String
+    Default: 10.10.20.0/24
+  TGWPrivateSubnetCidr:
+    Description: Cidr Block for TGW Private Subnet
+    Type: String
+    Default: 10.10.30.0/24
+
+# Region별로 AMI와 Instance type을 mapping
+# 현재 AMI OS는 Ubuntu입니다.
+Mappings:
+  RegionMap:
+    # 서울
+    ap-northeast-2:
+      AMI: ami-0252a84eb1d66c2a0
+      InstanceType: t2.micro
+    # 싱가포르
+    ap-southeast-1:
+      AMI: ami-0907c2c44ea451f84
+      InstanceType: t2.micro
+    # 오사카
+    ap-northeast-3:
+      AMI: ami-07e3bcd10e6a36441
+      InstanceType: t2.micro
+
+# Mapping 참조 방식     
+# ImageId: !FindInMap
+#   - RegionMap
+#   - !Ref "AWS::Region"
+#   - AMI
+
+Resources:
+  # VPC
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VPCCidr
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: VPC-ASG
+
+  # Subnets
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: !Select [ 0, !GetAZs ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: public1
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Select [ 2, !GetAZs ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: public2
+
+  # Internet Gateway
+  IGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: myigw
+  Attachigw:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref IGW
+      VpcId: !Ref VPC
+
+  # Public Route Table : IGW 경로 추가, 퍼블릭 서브넷 2개에 연결
+  PublicRT:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Public RT
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: Attachigw
+    Properties:
+      RouteTableId: !Ref PublicRT
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IGW
+  PublicSubnet1RTAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRT
+      SubnetId:
+        !Ref PublicSubnet1
+  PublicSubnet2RTAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRT
+      SubnetId:
+        !Ref PublicSubnet2
+   
+  # 시작 구성을 위한 보안 그룹 : 웹 규칙 추가
+  # RDS 엔진에 따라 보안 규칙 추가가 필요합니다.
+  SGforWeb:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: allow 22, 80
+      GroupName: webaccess
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+      VpcId: !Ref VPC
+
+  # Auto Scaling을 위한 시작 구성 : 리전별 AMI/Instance type 매핑
+  LC:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: !FindInMap
+        - RegionMap
+        - !Ref "AWS::Region"
+        - AMI
+      InstanceType: !FindInMap
+        - RegionMap
+        - !Ref "AWS::Region"
+        - InstanceType
+      InstanceMonitoring: true
+      KeyName: !Ref Key
+      LaunchConfigurationName: webserverLC
+      SecurityGroups:
+        - !Ref SGforWeb
+      # 시작 구성 : 서버에 적용할 명령어를 작성해주세요.
+      # 현재 작성된 명령어는 Ubuntu 기준입니다.
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          apt-get update
+          echo 'root:qwer1234' | chpasswd
+          sed -i "s/^PasswordAuthentication no/PasswordAuthentication yes/g" /etc/ssh/sshd_config
+          sed -i 's,\(\#PermitRootLogin.*\),\1\nPermitRootLogin yes,g' /etc/ssh/sshd_config
+          service sshd restart                   
+          
+          apt-get install -y apache2
+          echo "Hello World" > /var/www/html/index.html
+          systemctl enable apache2
+          systemctl start apache2
+
+  # Application Load Balancer : 웹 보안 그룹, 퍼블릭 서브넷 연결
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: webserverALB
+      Type: application
+      SecurityGroups:
+        - !Ref SGforWeb
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+
+  # 대상 그룹
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: ALB
+    Properties:
+      VpcId: !Ref VPC
+      Name: webtest
+      Port: 80
+      Protocol: HTTP
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 5
+      UnhealthyThresholdCount: 2
+
+  # ALB 리스너
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup   
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+
+  # Auto Scaling Group : 퍼블릭 서브넷 2개 연결
+  ASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: webserverASG
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      Cooldown: 10
+      LaunchConfigurationName: !Ref LC
+      MaxSize: 4
+      MinSize: 2
+      DesiredCapacity: 2
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      Tags:
+        - Key: Name
+          Value: web-asg
+          PropagateAtLaunch: true
+
+  # 정책
+  ASGPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref ASG
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 5
+
+  # Transit Gateway 연결용 프라이빗 서브넷
+  TGWPrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref TGWPrivateSubnetCidr
+      AvailabilityZone: !Select [ 0, !GetAZs ]
+      Tags:
+        - Key: Name
+          Value: private-for-TGW
+  # TGW 서브넷을 위한 프라이빗 라우팅 테이블
+  # 경로 추가 필요없습니다.
+  TGWPrivateRT:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: TGW-PrivateRouteTable
+  TGWSNRTAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref TGWPrivateRT
+      SubnetId: !Ref TGWPrivateSubnet
+      
+  # TGW 생성 + VPC/Subnet에 Attachment
+  TransitGateway1:
+    Type: AWS::EC2::TransitGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: TGW1
+  TransitGatewayAtt1:
+    Type: AWS::EC2::TransitGatewayAttachment
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      SubnetIds:
+        - !Ref TGWPrivateSubnet
+      TransitGatewayId: !Ref TransitGateway1
+      Tags:
+        - Key: Name
+          Value: TGW1-ATT1-VPC
+  
+  # Route for TGW-VPC : 퍼블릭 라우팅 테이블에 추가되는 경로입니다.
+  # Destination이 다른 리전의 CIDR이라면, TGW로 보냅니다
+  TGWRouteToOther:
+    Type: AWS::EC2::Route
+    DependsOn: TransitGatewayAtt1
+    Properties:
+      RouteTableId: !Ref PublicRT
+      DestinationCidrBlock: 10.0.0.0/8
+      TransitGatewayId: !Ref TransitGateway1
+  # 10.0.0.0/8로 지정하면 퍼블릭 라우팅 테이블에 경로를 더 추가할 필요 없습니다.
+  # 10.20.0.0/16(싱가포르 리전 VPC의 CIDR)으로 지정했다면 10.30.0.0/16(오사카 리전 VPC의 CIDR)도 추가해야 합니다.
+
+  # RDS 접근을 위한 규칙
+  SGforRDS:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: allow 3306
+      GroupName: mysqlaccess
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 0.0.0.0/0
+      VpcId: !Ref VPC
+
+  # RDS Database 서울리전에 1개 구성
+  # MasterUsername, Password 임의로 지정함
+  RDSDatabase:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBName: TMI
+      DBInstanceIdentifier: TMI-db
+      AllocatedStorage: "5"
+      DBInstanceClass: db.t2.micro
+      Engine: MySQL
+      MasterUsername: tmidb
+      MasterUserPassword: tmipw503
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups: 
+        - !Ref SGforRDS
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: DBsubnetgroup
+      SubnetIds:
+        - Ref: PublicSubnet1
+        - Ref: PublicSubnet2
+
+# 인스턴스에서 sudo apt-get install mysql-server 설치하여 DB접근 확인
+
+
+  # FlowLog를 위한 코드 : IAM Role/Policy 생성, LogGroup 생성, FlowLog 생성
+  FlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - vpc-flow-logs.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      
+  FlowLogPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: FlowLogPolicy
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogGroups
+              - logs:DescribeLogStreams
+            Resource: !GetAtt 'FlowLogGroup.Arn'
+      Roles:
+        - !Ref FlowLogRole
+        
+  FlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: vpc-flowlog-group
+      RetentionInDays: 1
+      
+  FlowLog:
+    Type: AWS::EC2::FlowLog
+    DependsOn: VPC
+    Properties:
+      DeliverLogsPermissionArn: !GetAtt FlowLogRole.Arn
+      LogGroupName: !Ref FlowLogGroup
+      MaxAggregationInterval: 60
+      ResourceId: !Ref VPC
+      ResourceType: VPC
+      TrafficType: ALL
+      LogFormat: '${vpc-id} ${subnet-id} ${instance-id} ${srcaddr} ${srcport} ${dstaddr} ${dstport} ${protocol} ${tcp-flags} ${type} ${pkt-srcaddr} ${pkt-dstaddr}'
+      Tags:
+        - Key: Name
+          Value: FlowLog-VPC
+
+
+
+
+#=============================여기까지는 그냥 배포하면 됩니다.=============================
+
+ 
+ # https://valiant-wrinkle-42b.notion.site/cloudfront-Accelator-929-19f12ddb6ce847ec8675fa4e2060970d
+ # https://binx.io/blog/2019/07/10/how-to-configure-an-aws-global-accelerator-in-cloudformation/
+ 
+ # GA  처음 지정하는 쪽에서는  GlobalAccelerator ,GAListener ,GAEndpointGroup 모두 작성필요 
+ # Seoul- Singapore 두 리전이라면  서울에서 3가지를 다써주고  싱가폴에서 GAEndpointGroup 만
+  GlobalAccelerator:
+      Type: AWS::GlobalAccelerator::Accelerator
+      Properties:
+        Name: !Sub '${AWS::StackName}'   
+        Enabled: true
+        IpAddressType: IPV4
+
+  GAListener:
+    Type: AWS::GlobalAccelerator::Listener
+    Properties:
+      AcceleratorArn: !Ref GlobalAccelerator
+      Protocol: TCP
+      PortRanges:
+        - FromPort: 80
+          ToPort: 80
+      ClientAffinity: NONE
+      
+  # GAListener   
+  # 참조받는쪽은 GAListenerARN 
+  GAEndpointGroup:
+    Type: AWS::GlobalAccelerator::EndpointGroup
+    DependsOn: ALB
+    Properties:
+      ListenerArn: !Ref GAListener    #GAListenerARN         
+      EndpointGroupRegion: !Ref AWS::Region   
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: '/'            
+      HealthCheckIntervalSeconds: 10
+      ThresholdCount: 5
+      EndpointConfigurations:
+        - EndpointId: !Ref ALB
+          weight : 100
+
+#=============================여기는 첫 번째 업데이트 부분입니다.=============================
+
+  # Transit Gateway Peering : 다른 리전의 TGW와 연결
+  
+  # PeerAccountId : 피어링을 요청받는 계정의 고유 번호입니다. 우리는 셀프 테스트니까 자신의 고유 번호를 작성합니다. 우측 상단의 계정 정보를 확인하세요.
+  # PeerRegion : Peering할 상대 Region명을 작성합니다. 서울은 ap-northeast-2, 싱가포르는 ap-southeast-1, 오사카는 ap-northeast-3
+  # PeerTransitGatewayId : 상대 리전에 있는 TGW ID를 긁어 붙인다(Cloudformation Output에도 있습니다)
+
+  # 배포할 리전에 따라 주석을 걸거나 해제해서 사용하세요.
+
+  # 1. 서울 -> 싱가포르 Peering
+  # SeoulSingaporePeering:
+    # Type: AWS::EC2::TransitGatewayPeeringAttachment
+    # DependsOn: TransitGateway1
+    # Properties: 
+      # PeerAccountId: 562664808209
+      # PeerRegion: ap-southeast-1
+      # PeerTransitGatewayId: tgw-06f006ca542af1bbe
+      # Tags: 
+        # - Key: Name
+          # Value: Seoul-Singapore-TGW-Peering
+      # TransitGatewayId: !Ref TransitGateway1
+
+  # 2. 서울 -> 오사카 Peering
+  # SeoulOsakaPeering:
+    # Type: AWS::EC2::TransitGatewayPeeringAttachment
+    # DependsOn: TransitGateway1
+    # Properties: 
+      # PeerAccountId: 562664808209
+      # PeerRegion: ap-northeast-3
+      # PeerTransitGatewayId: tgw-06f006ca542af1bbe
+      # Tags: 
+        # - Key: Name
+          # Value: Seoul-Osaka-TGW-Peering
+      # TransitGatewayId: !Ref TransitGateway1
+      
+  # 3. 싱가포르 -> 오사카 Peering
+  # SeoulOsakaPeering:
+    # Type: AWS::EC2::TransitGatewayPeeringAttachment
+    # DependsOn: TransitGateway1
+    # Properties: 
+      # PeerAccountId: 562664808209
+      # PeerRegion: ap-northeast-3
+      # PeerTransitGatewayId: tgw-06f006ca542af1bbe
+      # Tags: 
+        # - Key: Name
+          # Value: Singapore-Osaka-TGW-Peering
+      # TransitGatewayId: !Ref TransitGateway1
+
+  # 업데이트가 끝나면 각 대상 리전으로 가서 Peering Attachment를 수락(Accept)하세요.
+ 
+ 
+#=============================여기는 두 번째 업데이트 부분입니다.=============================
+ 
+  # Peering 이후 업데이트 : Peering Attachment의 ID가 필요하기 때문입니다.
+  # 현재 리전에 있는 기본 TGW 라우팅 테이블의 ID와 다른 리전과의 TGW Peering으로 생긴 연결(Attachment) ID를 긁어 업데이트
+  # 서울에는 1, 2번을/싱가포르에는 2, 3번을/오사카에는 1, 3번을 추가합니다
+
+  # 1. Singapore 리전의 TGW로의 경로를 현재 TGW 라우팅 테이블에 추가(TGWRouteToOther)
+  # TGWStaticRouteToSingapore:
+    # Type: AWS::EC2::TransitGatewayRoute
+    # DependsOn: TransitGateway1
+    # Properties:
+      # DestinationCidrBlock: 10.20.0.0/16
+      # TransitGatewayRouteTableId: tgw-rtb-0ff3f9a6e58486163
+      # TransitGatewayAttachmentId: tgw-attach-0a6547e124d59de17
+
+  # 2. Osaka 리전의 TGW로의 경로를 현재 TGW 라우팅 테이블에 추가(TGWRouteToOther)
+  # TGWStaticRouteToOsaka:
+    # Type: AWS::EC2::TransitGatewayRoute
+    # DependsOn: TransitGateway1
+    # Properties:
+      # DestinationCidrBlock: 10.30.0.0/16
+      # TransitGatewayRouteTableId: tgw-rtb-0ff3f9a6e58486163
+      # TransitGatewayAttachmentId: tgw-attach-0a6547e124d59de17
+
+  # 3. Seoul 리전의 TGW로의 경로를 현재 TGW 라우팅 테이블에 추가(TGWRouteToOther)
+  # TGWStaticRouteToSeoul:
+    # Type: AWS::EC2::TransitGatewayRoute
+    # DependsOn: TransitGateway1
+    # Properties:
+      # DestinationCidrBlock: 10.10.0.0/16
+      # TransitGatewayRouteTableId: tgw-rtb-0ff3f9a6e58486163
+      # TransitGatewayAttachmentId: tgw-attach-0a6547e124d59de17
+
+#=========================== ROUTE53 업데이트 ========================
+
+  # ROUTE53 추가
+#  PublicDNS:
+#    Type: AWS::Route53::HostedZone
+#    Properties:
+#      HostedZoneConfig:
+#        Comment: Public hosted zone For jeo301.ml
+#      Name: jeo301.ml 
+  
+  
+  # 리전별 ALB 레코드 추가
+  # AliasTarget 부분에 DNSName, HostedZoneId 두가지 항목은 로드밸런서 속성 확인 후 값 추가
+  # DNSName : DNS이름(A레코드)
+  # HostedZoneId : 호스팅영역
+  # 도메인은 하나로 통일, 지리적위치 라우팅 정책을 사용하여 
+  # 한국사용자 -> 서울리전 ALB로 연결
+  # 싱가폴사용자 -> 싱가폴리전 ALB로 연결
+  # 일본사용자 -> 오사카리전 ALB로 연결
+  
+  # 서울리전 ALB 레코드 추가
+#  ALBALias1:
+#    Type: AWS::Route53::RecordSet
+#    Properties:
+#      Name: tmi.jeo301.ml
+#      Type: A
+#      HostedZoneId: !Ref PublicDNS
+#      AliasTarget: 
+#        DNSName: "webserverALB-1020465911.ap-northeast-2.elb.amazonaws.com"
+#        HostedZoneId: "ZWKZPGTI48KDX"
+#      GeoLocation:
+#        CountryCode: KR
+#      SetIdentifier: "South Korea"
+
+  # 싱가포르리전 ALB 레코드 추가    
+#  ALBALias2:
+#    Type: AWS::Route53::RecordSet
+#    Properties:
+#      Name: tmi.jeo301.ml
+#      Type: A
+#      HostedZoneId: !Ref PublicDNS
+#      AliasTarget: 
+#        DNSName: "webserverALB-815731363.ap-southeast-1.elb.amazonaws.com"
+#        HostedZoneId: "Z1LMS91P8CMLE5"
+#      GeoLocation:
+#        CountryCode: SG
+#      SetIdentifier: "Singapore"
+
+  # 오사카리전 ALB 레코드 추가
+#  ALBALias3:
+#    Type: AWS::Route53::RecordSet
+#    Properties:
+#      Name: tmi.jeo301.ml
+#      Type: A
+#      HostedZoneId: !Ref PublicDNS
+#      AliasTarget: 
+#        DNSName: "webserverALB-165881927.ap-northeast-3.elb.amazonaws.com"
+#        HostedZoneId: "Z5LXEXXYW11ES"
+#      GeoLocation:
+#        CountryCode: JP
+#      SetIdentifier: "Japan"
+
+Outputs:
+  # ALB DNS 출력
+  ALBDNS:
+    Description: DNS of ALB
+    Value: !GetAtt ALB.DNSName
+  
+  # Transit Gateway ID
+  SeoulTGWID:
+    Description: TGW ID of Current Region 
+    Value: !Ref TransitGateway1
+    
+ # GlobalAccelator ARN
+  GAListenerARN:
+    Description: Global Accelerator Arn
+    Value: !GetAtt GAListener.ListenerArn
